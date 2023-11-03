@@ -67,6 +67,7 @@ class MemGPTConfig:
     embedding_model: str = "openai"
     embedding_dim: int = 768
     embedding_chunk_size: int = 300  # number of tokens
+    huggingface_model: str = None  # for local embeddings model
 
     # database configs: archival
     archival_storage_type: str = "local"  # local, db
@@ -396,6 +397,20 @@ class Config:
             self.compute_embeddings = await questionary.confirm(
                 "Would you like to compute embeddings over these files to enable embeddings search?"
             ).ask_async()
+
+            embedding_model_choice = await questionary.select(
+                "Which embedding model would you like to use?",
+                choices=[
+                    questionary.Choice("OpenAI", value="openai"),
+                    questionary.Choice("Hugging Face", value="huggingface"),
+                ],
+            ).ask_async()
+            if embedding_model_choice == "huggingface":
+                huggingface_model = await questionary.text(
+                    "Please enter the Hugging Face model:", default="thenlper/gte-large"  # or jinaai/jina-embeddings-v2-base-en
+                ).ask_async()
+                MemGPTConfig.huggingface_model = huggingface_model  # Set the Hugging Face model
+
             await self.configure_archival_storage(self.compute_embeddings)
 
         self.write_config()
@@ -404,11 +419,15 @@ class Config:
     async def configure_archival_storage(self, recompute_embeddings):
         if recompute_embeddings:
             if self.host:
-                interface.warning_message(
-                    "⛔️ Embeddings on a non-OpenAI endpoint are not yet supported, falling back to substring matching search."
+                #     interface.warning_message(
+                #         "⛔️ Embeddings on a non-OpenAI endpoint are not yet supported, falling back to substring matching search."
+                #     )
+                # else:
+                self.archival_storage_index = await utils.prepare_archival_index_from_files_compute_embeddings(
+                    self.archival_storage_files,
+                    model="local",
+                    embeddings_model=MemGPTConfig.huggingface_model,  # Pass the Hugging Face model if specified
                 )
-            else:
-                self.archival_storage_index = await utils.prepare_archival_index_from_files_compute_embeddings(self.archival_storage_files)
         if self.compute_embeddings and self.archival_storage_index:
             self.index, self.archival_database = utils.prepare_archival_index(self.archival_storage_index)
         else:

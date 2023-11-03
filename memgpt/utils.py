@@ -19,6 +19,9 @@ from memgpt.openai_tools import async_get_embedding_with_backoff
 from memgpt.constants import MEMGPT_DIR
 from llama_index import set_global_service_context, ServiceContext, VectorStoreIndex, load_index_from_storage, StorageContext
 from llama_index.embeddings import OpenAIEmbedding
+import torch
+from transformers import AutoTokenizer, AutoModel
+from numba import cuda
 
 
 def count_tokens(s: str, model: str = "gpt-4") -> int:
@@ -151,7 +154,8 @@ def total_bytes(pattern):
 
 
 def chunk_file(file, tkns_per_chunk=300, model="gpt-4"):
-    encoding = tiktoken.encoding_for_model(model)
+    model_hc = "gpt-4"  # overwriting model with hardcoded "gpt-4" TODO: fix
+    encoding = tiktoken.encoding_for_model(model_hc)
 
     if file.endswith(".db"):
         return  # can't read the sqlite db this way, will get handled in main.py
@@ -201,7 +205,7 @@ def chunk_files(files, tkns_per_chunk=300, model="gpt-4"):
         timestamp = os.path.getmtime(file)
         formatted_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %I:%M:%S %p %Z%z")
         file_stem = file.split("/")[-1]
-        chunks = [c for c in chunk_file(file, tkns_per_chunk, model)]
+        chunks = [c for c in chunk_file(file, tkns_per_chunk, "gpt-4")]  # replaced model with hardcoded "gpt-4" TODO: fix
         for i, chunk in enumerate(chunks):
             archival_database.append(
                 {
@@ -228,21 +232,57 @@ def chunk_files_for_jsonl(files, tkns_per_chunk=300, model="gpt-4"):
     return ret
 
 
-async def process_chunk(i, chunk, model):
+# Define a function to compute embeddings using the local / Hugging Face model
+async def compute_embedding_local(text, model, tkns_per_chunk):
+    # Load tokenizer and model from Hugging Face Model Hub
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    embed_automodel = AutoModel.from_pretrained(model)
+
+    # Check if a GPU is available and move the model to GPU if possible
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        return i, await async_get_embedding_with_backoff(chunk["content"], model=model)
+        embed_automodel.to(device)
+
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=tkns_per_chunk)
+        inputs = {name: tensor.to(device) for name, tensor in inputs.items()}  # Move inputs to the same device as the model
+
+        with torch.no_grad():
+            outputs = embed_automodel(**inputs)
+        # Assuming the model returns a single tensor as output.
+        # You may need to adjust this depending on the model.
+        embeddings_array = outputs.last_hidden_state.mean(dim=1).cpu().numpy()  # Move the tensor back to CPU and convert to numpy array
+        embeddings_list = embeddings_array.tolist()  # Convert numpy array to a list
+        pass
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        # Release GPU resources here
+        cuda.select_device(0)
+        cuda.close()
+        raise e  # Re-raise the exception if needed
+
+    return embeddings_list
+
+
+async def process_chunk(i, chunk, model, tkns_per_chunk):
+    try:
+        if model == "gpt-4":
+            return i, await async_get_embedding_with_backoff(chunk["content"], model=model)
+        elif model == "jinaai/jina-embeddings-v2-base-en":  # TODO: add other models
+            return i, await compute_embedding_local(chunk["content"], model=model, tkns_per_chunk=tkns_per_chunk)
+        elif model == "thenlper/gte-large":
+            return i, await compute_embedding_local(chunk["content"], model=model, tkns_per_chunk=tkns_per_chunk)
     except Exception as e:
         print(chunk)
         raise e
 
 
-async def process_concurrently(archival_database, model, concurrency=10):
+async def process_concurrently(archival_database, model, tkns_per_chunk, concurrency=10):
     # Create a semaphore to limit the number of concurrent tasks
     semaphore = asyncio.Semaphore(concurrency)
 
     async def bounded_process_chunk(i, chunk):
         async with semaphore:
-            return await process_chunk(i, chunk, model)
+            return await process_chunk(i, chunk, model, tkns_per_chunk)
 
     # Create a list of tasks for chunks
     embedding_data = [0 for _ in archival_database]
@@ -261,7 +301,7 @@ async def process_concurrently(archival_database, model, concurrency=10):
 
 async def prepare_archival_index_from_files_compute_embeddings(
     glob_pattern,
-    tkns_per_chunk=300,
+    tkns_per_chunk=400,
     model="gpt-4",
     embeddings_model="text-embedding-ada-002",
 ):
@@ -271,15 +311,23 @@ async def prepare_archival_index_from_files_compute_embeddings(
         "archival_index_from_files_" + get_local_time().replace(" ", "_").replace(":", "_"),
     )
     os.makedirs(save_dir, exist_ok=True)
-    total_tokens = total_bytes(glob_pattern) / 3
-    price_estimate = total_tokens / 1000 * 0.0001
-    confirm = input(f"Computing embeddings over {len(files)} files. This will cost ~${price_estimate:.2f}. Continue? [y/n] ")
-    if confirm != "y":
-        raise Exception("embeddings were not computed")
 
-    # chunk the files, make embeddings
     archival_database = chunk_files(files, tkns_per_chunk, model)
-    embedding_data = await process_concurrently(archival_database, embeddings_model)
+
+    if model == "local":
+        # Replace the existing `process_concurrently` function call with the new one
+        embedding_data = await process_concurrently(archival_database, embeddings_model, tkns_per_chunk)
+    elif model == "gpt-4":
+        total_tokens = total_bytes(glob_pattern) / 3
+        price_estimate = total_tokens / 1000 * 0.0001
+        confirm = input(f"Computing embeddings over {len(files)} files. This will cost ~${price_estimate:.2f}. Continue? [y/n] ")
+        if confirm != "y":
+            raise Exception("embeddings were not computed")
+
+        # chunk the files, make embeddings
+
+        embedding_data = await process_concurrently(archival_database, embeddings_model, tkns_per_chunk)
+
     embeddings_file = os.path.join(save_dir, "embeddings.json")
     with open(embeddings_file, "w") as f:
         print(f"Saving embeddings to {embeddings_file}")
@@ -295,8 +343,13 @@ async def prepare_archival_index_from_files_compute_embeddings(
             f.write("\n")
 
     # make the faiss index
-    index = faiss.IndexFlatL2(1536)
+
     data = np.array(embedding_data).astype("float32")
+    data = np.squeeze(data, axis=1)
+
+    # Get the dimensionality of the data from the shape of the array
+    dim = data.shape[1]
+    index = faiss.IndexFlatL2(dim)  # for some reason dim was hard coded to 1536 before TODO: double-check please
     try:
         index.add(data)
     except Exception as e:
